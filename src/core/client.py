@@ -101,49 +101,71 @@ class OpenAIClient:
                 del self.active_requests[request_id]
     
     async def create_chat_completion_stream(self, request: Dict[str, Any], request_id: Optional[str] = None) -> AsyncGenerator[str, None]:
-        """Send streaming chat completion to OpenAI API with cancellation support."""
-        
+        """Send streaming chat completion to OpenAI API with cancellation support.
+
+        NOTE: once the first chunk is yielded, SSE headers are already on the wire.
+        Raising HTTPException after that point doesn't produce a clean error
+        response, it just breaks the generator mid-stream. So every error path
+        below yields an SSE error event instead of raising, and the generator
+        always returns normally.
+        """
+
         # Create cancellation token if request_id provided
         if request_id:
             cancel_event = asyncio.Event()
             self.active_requests[request_id] = cancel_event
-        
+
+        def _error_event(status_code: int, detail: str) -> str:
+            payload = {
+                "error": {
+                    "message": detail,
+                    "type": "stream_error",
+                    "code": status_code,
+                }
+            }
+            return f"data: {json.dumps(payload, ensure_ascii=False)}"
+
         try:
             # Ensure stream is enabled
             request["stream"] = True
             if "stream_options" not in request:
                 request["stream_options"] = {}
             request["stream_options"]["include_usage"] = True
-            
+
             # Create the streaming completion
             streaming_completion = await self.client.chat.completions.create(**request)
-            
+
+            cancelled = False
             async for chunk in streaming_completion:
                 # Check for cancellation before yielding each chunk
                 if request_id and request_id in self.active_requests:
                     if self.active_requests[request_id].is_set():
-                        raise HTTPException(status_code=499, detail="Request cancelled by client")
-                
+                        cancelled = True
+                        break
+
                 # Convert chunk to SSE format matching original HTTP client format
                 chunk_dict = chunk.model_dump()
                 chunk_json = json.dumps(chunk_dict, ensure_ascii=False)
                 yield f"data: {chunk_json}"
-            
-            # Signal end of stream
-            yield "data: [DONE]"
-                
+
+            if cancelled:
+                yield _error_event(499, "Request cancelled by client")
+            else:
+                # Signal end of stream
+                yield "data: [DONE]"
+
         except AuthenticationError as e:
-            raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
+            yield _error_event(401, self.classify_openai_error(str(e)))
         except RateLimitError as e:
-            raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
+            yield _error_event(429, self.classify_openai_error(str(e)))
         except BadRequestError as e:
-            raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
+            yield _error_event(400, self.classify_openai_error(str(e)))
         except APIError as e:
             status_code = getattr(e, 'status_code', 500)
-            raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
+            yield _error_event(status_code, self.classify_openai_error(str(e)))
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-        
+            yield _error_event(500, f"Unexpected error: {str(e)}")
+
         finally:
             # Clean up active request tracking
             if request_id and request_id in self.active_requests:
